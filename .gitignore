@@ -1,0 +1,25 @@
+# Python 관련
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+
+# 환경 설정 파일
+.env
+credentials.json
+
+# Node.js 관련
+node_modules/
+
+# IDE 설정 파일 (VSCode 등)
+.vscode/
+
+# MacOS 관련
+.DS_Store
+
+# 기타 파일
+*.log
+
+# Python 가상 환경 폴더 제외
+venv/
