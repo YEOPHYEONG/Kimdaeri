@@ -16,19 +16,25 @@ logger = logging.getLogger(__name__)
 
 class CohereService:
     def __init__(self):
-        api_key = os.getenv('COHERE_API_KEY')
-        if not api_key:
-            logger.error("COHERE_API_KEY environment variable is not set")
-            raise ValueError("COHERE_API_KEY environment variable is not set")
-        self.co = cohere.Client(api_key)
-        self.embeddings_dir = Path("embeddings")
-        self.embeddings_dir.mkdir(exist_ok=True)
-        
-        # FAISS 인덱스 초기화
-        self.dimension = 1024  # Cohere embed-multilingual-v3.0의 임베딩 차원
-        self.index = None
-        self.documents = []
-        logger.info("CohereService initialized successfully")
+        """Cohere 서비스 초기화"""
+        try:
+            api_key = os.getenv('COHERE_API_KEY')
+            if not api_key:
+                raise ValueError("COHERE_API_KEY environment variable is not set")
+            
+            self.co = cohere.Client(api_key=api_key)
+            self.index_dir = Path(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'indices'))
+            self.index_dir.mkdir(parents=True, exist_ok=True)
+            
+            # FAISS 인덱스 초기화
+            self.dimension = 1024  # Cohere embed-multilingual-v3.0의 임베딩 차원
+            self.index = None
+            self.documents = []
+            
+            logger.info("CohereService initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing CohereService: {str(e)}", exc_info=True)
+            raise
 
     def chunk_text(self, text: str, chunk_size: int = 1000) -> List[str]:
         """텍스트를 청크로 분할"""
@@ -58,7 +64,7 @@ class CohereService:
             logger.error(f"Error chunking text: {str(e)}", exc_info=True)
             raise
 
-    def create_embeddings(self, texts: List[str]) -> List[List[float]]:
+    def create_embeddings(self, texts: List[str], input_type: str = "search_document") -> List[List[float]]:
         """텍스트 임베딩 생성"""
         try:
             logger.info(f"Creating embeddings for {len(texts)} texts")
@@ -67,11 +73,12 @@ class CohereService:
             response = self.co.embed(
                 texts=texts,
                 model='embed-multilingual-v3.0',
-                input_type='search_document'
+                input_type=input_type
             )
             
+            embeddings = response.embeddings
             logger.info("Embeddings created successfully")
-            return response.embeddings
+            return embeddings
         except Exception as e:
             logger.error(f"Error creating embeddings: {str(e)}", exc_info=True)
             raise
@@ -84,11 +91,11 @@ class CohereService:
                 return
             
             # 인덱스 저장
-            index_path = self.embeddings_dir / f"{folder_id}.index"
+            index_path = self.index_dir / f"{folder_id}.index"
             faiss.write_index(self.index, str(index_path))
             
             # 문서 메타데이터 저장
-            metadata_path = self.embeddings_dir / f"{folder_id}_metadata.json"
+            metadata_path = self.index_dir / f"{folder_id}_metadata.json"
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(self.documents, f, ensure_ascii=False, indent=2)
             
@@ -100,8 +107,8 @@ class CohereService:
     def load_index(self, folder_id: str) -> bool:
         """FAISS 인덱스 로드"""
         try:
-            index_path = self.embeddings_dir / f"{folder_id}.index"
-            metadata_path = self.embeddings_dir / f"{folder_id}_metadata.json"
+            index_path = self.index_dir / f"{folder_id}.index"
+            metadata_path = self.index_dir / f"{folder_id}_metadata.json"
             
             if not index_path.exists() or not metadata_path.exists():
                 logger.warning(f"No index found for folder {folder_id}")
@@ -121,7 +128,7 @@ class CohereService:
             raise
 
     def process_folder(self, folder_id: str, documents: List[Dict[str, Any]]):
-        """폴더의 문서들을 처리하여 임베딩을 누적 생성 및 저장"""
+        """폴더의 문서들을 처리하여 임베딩을 생성하고 저장"""
         try:
             logger.info(f"Processing {len(documents)} documents from folder {folder_id}")
             
@@ -132,37 +139,104 @@ class CohereService:
                 chunks = self.chunk_text(doc['content'])
                 all_chunks.extend(chunks)
                 chunk_metadata.extend([{
-                    'file_id': doc['file_id'],
-                    'file_name': doc['file_name'],
-                    'chunk_index': i,
-                    'content': chunk
+                    'document_id': doc['file_id'],  # Google Drive의 file_id 사용
+                    'chunk_id': i,
+                    'content': chunk,
+                    'metadata': {
+                        'file_name': doc['file_name'],
+                        'file_id': doc['file_id'],
+                        'mime_type': doc.get('mime_type', ''),
+                        'created_time': doc.get('created_time', ''),
+                        'modified_time': doc.get('modified_time', '')
+                    }
                 } for i, chunk in enumerate(chunks)])
             
             # 청크 임베딩 생성
             embeddings = self.create_embeddings(all_chunks)
             embeddings_np = np.array(embeddings).astype('float32')
             
-            # 기존 인덱스/메타데이터가 있으면 불러와서 누적, 없으면 새로 생성
-            index_path = self.embeddings_dir / f"{folder_id}.index"
-            metadata_path = self.embeddings_dir / f"{folder_id}_metadata.json"
-            if index_path.exists() and metadata_path.exists():
-                logger.info(f"기존 인덱스와 메타데이터를 불러와 누적합니다.")
-                self.load_index(folder_id)
-                self.index.add(embeddings_np)
-                self.documents.extend(chunk_metadata)
-            else:
-                logger.info(f"새 인덱스와 메타데이터를 생성합니다.")
-                self.index = faiss.IndexFlatL2(self.dimension)
-                self.index.add(embeddings_np)
-                self.documents = chunk_metadata
+            # FAISS 인덱스 생성
+            self.index = faiss.IndexFlatL2(self.dimension)
+            self.index.add(embeddings_np)
+            self.documents = chunk_metadata
             
             # 인덱스 저장
             self.save_index(folder_id)
             
-            logger.info(f"Successfully processed folder {folder_id} (누적 저장)")
+            logger.info(f"Successfully processed folder {folder_id}")
             return True
         except Exception as e:
             logger.error(f"Error processing folder: {str(e)}", exc_info=True)
+            raise
+
+    def search_documents(self, folder_id: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """문서 검색 (RAG)"""
+        try:
+            logger.info(f"Searching documents in folder {folder_id} with query: {query}")
+            
+            # 인덱스 로드
+            if not self.load_index(folder_id):
+                logger.error(f"No index found for folder {folder_id}")
+                return []
+            
+            # 쿼리 임베딩 생성
+            query_embedding = self.create_embeddings([query], input_type="search_query")[0]
+            
+            # FAISS 검색
+            distances, indices = self.index.search(np.array([query_embedding]).astype('float32'), min(20, len(self.documents)))
+            
+            # 검색 결과 준비
+            search_results = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.documents):
+                    doc = self.documents[idx]
+                    search_results.append({
+                        'text': doc['content'],
+                        'metadata': {
+                            'file_name': doc['metadata']['file_name'],
+                            'file_id': doc['metadata']['file_id'],
+                            'chunk_index': doc['chunk_id'],  # chunk_id를 chunk_index로 매핑
+                            'mime_type': doc['metadata'].get('mime_type', ''),
+                            'created_time': doc['metadata'].get('created_time', ''),
+                            'modified_time': doc['metadata'].get('modified_time', '')
+                        },
+                        'score': float(1 / (1 + distances[0][i]))  # 거리를 유사도 점수로 변환
+                    })
+            
+            if not search_results:
+                return []
+            
+            # Rerank 수행
+            try:
+                rerank_response = self.co.rerank(
+                    query=query,
+                    documents=search_results,
+                    model='rerank-multilingual-v3.0',
+                    top_n=min(top_k, len(search_results))
+                )
+                
+                # 최종 결과 포맷팅
+                results = []
+                for result in rerank_response:
+                    results.append({
+                        'content': result.document['text'],
+                        'score': result.relevance_score,
+                        'metadata': result.document['metadata']  # 메타데이터 구조 유지
+                    })
+                
+                logger.info(f"Found {len(results)} results after reranking")
+                return results
+            except Exception as e:
+                logger.error(f"Error in reranking: {str(e)}", exc_info=True)
+                # rerank 실패 시 원래 검색 결과 반환
+                return [{
+                    'content': doc['text'],
+                    'score': doc['score'],
+                    'metadata': doc['metadata']  # 메타데이터 구조 유지
+                } for doc in search_results[:top_k]]
+            
+        except Exception as e:
+            logger.error(f"Error searching documents: {str(e)}", exc_info=True)
             raise
 
     def generate_queries(self, user_message: str) -> List[str]:
@@ -188,113 +262,9 @@ class CohereService:
             logger.error(f"Error generating queries: {str(e)}", exc_info=True)
             return [user_message]  # 오류 발생 시 원본 메시지를 쿼리로 사용
 
-    def search_documents(self, folder_id: str, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """문서 검색 (RAG)"""
-        try:
-            logger.info(f"Searching documents in folder {folder_id} for query: {query}")
-            
-            # 인덱스 로드
-            if not self.load_index(folder_id):
-                logger.error(f"No index found for folder {folder_id}")
-                return []
-            
-            # 쿼리 임베딩 생성
-            query_embedding = self.create_embeddings([query])[0]
-            
-            # FAISS로 초기 검색 (더 많은 결과 가져오기)
-            distances, indices = self.index.search(
-                np.array([query_embedding]).astype('float32'),
-                min(20, len(self.documents))  # 최대 20개 결과 (더 다양한 문서 찾기)
-            )
-            
-            # 검색 결과 준비
-            search_results = []
-            seen_document_keys = set()  # 중복 문서 식별용
-            
-            for i, idx in enumerate(indices[0]):
-                if idx != -1:  # FAISS가 결과를 찾지 못한 경우 -1 반환
-                    # 파일ID와 청크 인덱스로 구성된 고유 키
-                    doc_key = f"{self.documents[idx]['file_id']}_{self.documents[idx]['chunk_index']}"
-                    
-                    # 중복 문서 방지
-                    if doc_key not in seen_document_keys:
-                        seen_document_keys.add(doc_key)
-                        search_results.append({
-                            'text': self.documents[idx]['content'],
-                            'metadata': {
-                                'file_name': self.documents[idx]['file_name'],
-                                'file_id': self.documents[idx]['file_id'],
-                                'chunk_index': self.documents[idx]['chunk_index']
-                            }
-                        })
-            
-            if not search_results:
-                return []
-            
-            logger.info(f"FAISS 초기 검색 결과: {len(search_results)}개 문서")
-            logger.debug(f"FAISS 검색 문서 파일명: {[doc['metadata']['file_name'] for doc in search_results[:5]]}")
-            
-            # Cohere rerank로 재순위화
-            try:
-                rerank_response = self.co.rerank(
-                    query=query,
-                    documents=search_results,
-                    model='rerank-multilingual-v3.0',
-                    top_n=min(top_k, len(search_results))
-                )
-                
-                # 최종 결과 포맷팅
-                results = []
-                seen_rerank_keys = set()  # rerank 결과에서 중복 방지
-                
-                for result in rerank_response:
-                    # 파일ID와 청크 인덱스로 구성된 고유 키
-                    result_key = f"{result.document['metadata']['file_id']}_{result.document['metadata']['chunk_index']}"
-                    
-                    # 중복 문서 방지
-                    if result_key not in seen_rerank_keys:
-                        seen_rerank_keys.add(result_key)
-                        results.append({
-                            'metadata': result.document['metadata'],
-                            'score': result.relevance_score,
-                            'content': result.document['text']
-                        })
-                
-                logger.info(f"Rerank 후 결과: {len(results)}개 문서 (중복 제거됨)")
-                logger.debug(f"Rerank 점수: {[r['score'] for r in results]}")
-                logger.debug(f"Rerank 문서 파일명: {[r['metadata']['file_name'] for r in results]}")
-                
-                # 상위 top_k개 결과만 반환
-                return results[:top_k]
-            except Exception as e:
-                logger.error(f"Error in reranking: {str(e)}", exc_info=True)
-                # 실패 시 FAISS 결과 그대로 반환
-                results = []
-                seen_faiss_keys = set()  # 다시 중복 체크
-                
-                for i, idx in enumerate(indices[0]):
-                    if idx != -1:
-                        # 파일ID와 청크 인덱스로 구성된 고유 키
-                        doc_key = f"{self.documents[idx]['file_id']}_{self.documents[idx]['chunk_index']}"
-                        
-                        # 중복 문서 방지
-                        if doc_key not in seen_faiss_keys and len(results) < top_k:
-                            seen_faiss_keys.add(doc_key)
-                            results.append({
-                                'metadata': {
-                                    'file_name': self.documents[idx]['file_name'],
-                                    'file_id': self.documents[idx]['file_id'],
-                                    'chunk_index': self.documents[idx]['chunk_index']
-                                },
-                                'score': 1.0 - distances[0][i] / (distances[0][0] if distances[0][0] > 0 else 1.0),
-                                'content': self.documents[idx]['content']
-                            })
-                
-                logger.info(f"Returning {len(results)} results from FAISS (중복 제거됨, rerank 없음)")
-                return results
-        except Exception as e:
-            logger.error(f"Error searching documents: {str(e)}", exc_info=True)
-            raise
+    def calculate_similarity(self, a: List[float], b: List[float]) -> float:
+        """두 임베딩 벡터 간의 유사도 계산"""
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
     def generate_report(self, folder_id: str, prompt: str) -> str:
         """보고서 생성"""
@@ -308,98 +278,28 @@ class CohereService:
             # 각 쿼리로 문서 검색
             all_relevant_docs = []
             for query in queries:
-                docs = self.search_documents(folder_id, query, top_k=3)  # 각 쿼리당 상위 3개 문서
+                docs = self.search_documents(folder_id, query, top_k=3)
                 all_relevant_docs.extend(docs)
-                
-                # 검색된 문서 점수와 내용 미리보기 로깅
-                for i, doc in enumerate(docs):
-                    logger.debug(f"쿼리 '{query}' 결과 {i+1}. 파일: {doc['metadata']['file_name']}, 점수: {doc['score']:.6f}")
-                    logger.debug(f"  내용 미리보기: {doc['content'][:100]}...")
             
             # 중복 제거 및 점수 기준 정렬
             unique_docs = {}
             for doc in all_relevant_docs:
-                key = f"{doc['metadata']['file_id']}_{doc['metadata']['chunk_index']}"
+                key = f"{doc['metadata'].get('document_id', '')}_{doc['metadata'].get('chunk_id', '')}"
                 if key not in unique_docs or doc['score'] > unique_docs[key]['score']:
                     unique_docs[key] = doc
             
-            # 최소 점수 임계값 설정 (최고 점수의 5%만 되어도 포함)
-            max_score = max([doc['score'] for doc in unique_docs.values()], default=0)
-            min_score_threshold = max_score * 0.05  # 최고 점수의 5%
-            
-            logger.info(f"최고 점수: {max_score:.6f}, 임계값: {min_score_threshold:.6f}")
-            
-            # 임계값 이상 문서만 선택하여 정렬
-            filtered_docs = [doc for doc in unique_docs.values() if doc['score'] >= min_score_threshold]
-            relevant_docs = sorted(filtered_docs, key=lambda x: x['score'], reverse=True)[:5]
-            
-            logger.info(f"보고서 작성을 위한 문서 {len(relevant_docs)}개 선택됨 (임계값: {min_score_threshold:.6f})")
-            for i, doc in enumerate(relevant_docs):
-                logger.info(f"참고문서 {i+1}. 파일: {doc['metadata']['file_name']}, 점수: {doc['score']:.6f}")
+            # 상위 문서 선택
+            relevant_docs = sorted(unique_docs.values(), key=lambda x: x['score'], reverse=True)[:5]
             
             if not relevant_docs:
                 logger.warning("No relevant documents found")
                 return "관련 문서를 찾을 수 없습니다."
             
-            # 전체 문서 내용 조회 (필요시)
-            try:
-                from src.services.google_drive import GoogleDriveService
-                drive_service = GoogleDriveService()
-                
-                # 선택된 문서들의 파일 ID 수집
-                file_ids = set()
-                for doc in relevant_docs:
-                    file_ids.add(doc['metadata']['file_id'])
-                
-                # 파일 전체 내용 조회
-                full_contents = {}
-                for file_id in file_ids:
-                    # 폴더 내 모든 파일 조회
-                    folder_contents = drive_service.get_folder_contents(folder_id)
-                    
-                    # 해당 파일 찾기
-                    for content in folder_contents:
-                        if content['file_id'] == file_id:
-                            full_contents[file_id] = {
-                                'file_name': content['file_name'],
-                                'content': content['content']
-                            }
-                            break
-                
-                logger.info(f"전체 문서 {len(full_contents)}개 조회 완료")
-            except Exception as e:
-                logger.warning(f"전체 문서 조회 중 오류 발생, 청크 내용만 사용합니다: {str(e)}")
-                full_contents = {}
-            
-            # 컨텍스트 구성 - 전체 문서와 관련 청크 모두 포함
-            context_parts = []
-            
-            # 1. 전체 문서 내용 (있는 경우)
-            for doc in relevant_docs:
-                file_id = doc['metadata']['file_id']
-                if file_id in full_contents:
-                    context_parts.append(
-                        f"[전체 문서] 파일: {full_contents[file_id]['file_name']}\n"
-                        f"내용: {full_contents[file_id]['content']}"
-                    )
-                    # 이미 전체 문서를 포함했으므로 해당 파일 ID 제거
-                    full_contents.pop(file_id, None)
-            
-            # 2. 관련 청크 (전체 문서가 없는 경우)
-            for doc in relevant_docs:
-                file_id = doc['metadata']['file_id']
-                # 이미 전체 문서로 포함되지 않은 문서의 청크만 추가
-                if file_id not in full_contents:
-                    context_parts.append(
-                        f"[청크] 파일: {doc['metadata']['file_name']}\n"
-                        f"내용: {doc['content']}"
-                    )
-            
-            # 최종 컨텍스트
-            context = "\n\n".join(context_parts)
-            
-            logger.debug(f"Context preview: {context[:200]}...")
-            logger.debug(f"Prompt: {prompt}")
+            # 컨텍스트 구성
+            context = "\n\n".join([
+                f"[문서 {i+1}] {doc['content']}"
+                for i, doc in enumerate(relevant_docs)
+            ])
             
             # 프롬프트 구성
             full_prompt = f"""다음은 보고서를 작성하기 위한 컨텍스트와 요청사항입니다:
@@ -432,17 +332,14 @@ class CohereService:
 
 보고서는 한국어로 작성해주세요. 반드시 제공된 여러 문서를 골고루 참고하여 종합적인 보고서를 작성하세요."""
 
-            # chat 메서드 사용
+            # 보고서 생성
             response = self.co.chat(
                 message=full_prompt,
                 temperature=0.7,
-                max_tokens=3000,  # 토큰 수 증가 (더 긴 보고서 허용)
-                p=0.75,
-                k=0
+                max_tokens=3000
             )
             
             logger.info("Report generated successfully")
-            logger.debug(f"Generated report preview: {response.text[:200]}...")
             return response.text
         except Exception as e:
             logger.error(f"Error generating report: {str(e)}", exc_info=True)
